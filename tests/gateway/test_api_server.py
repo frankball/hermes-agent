@@ -961,6 +961,36 @@ class TestSkillsEndpoint:
         with patch(
             "tools.skills_tool.find_all_skills",
             return_value=list(fake_skills),
+        ), patch(
+            "tools.skills_tool.sort_skills",
+            side_effect=lambda x: x,
+        ), patch(
+            "tools.skills_tool._skill_catalog",
+            return_value=[],
+        ), patch(
+            "tools.skill_usage._read_bundled_names",
+            return_value={"github"},
+        ), patch(
+            "tools.skill_usage._read_hub_installed_names",
+            return_value=set(),
+        ), patch(
+            "tools.skill_usage._external_skill_names",
+            return_value=set(),
+        ), patch(
+            "tools.skill_usage.load_usage",
+            return_value={"github": {"use": 3, "view": 1, "patch": 0}},
+        ), patch(
+            "tools.skill_usage.locked_skill_names",
+            return_value=[],
+        ), patch(
+            "tools.skill_usage.activity_count",
+            side_effect=lambda r: sum(r.get(k, 0) for k in ("use", "view", "patch")),
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={},
+        ), patch(
+            "hermes_cli.skills_config.get_disabled_skills",
+            return_value=set(),
         ):
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
@@ -971,7 +1001,16 @@ class TestSkillsEndpoint:
                 names = sorted(s["name"] for s in data["data"])
                 assert names == ["ascii-art", "github"]
                 for entry in data["data"]:
-                    assert set(entry.keys()) >= {"name", "description", "category"}
+                    assert set(entry.keys()) >= {"name", "description", "category", "locked", "enabled", "usage", "provenance"}
+                by_name = {s["name"]: s for s in data["data"]}
+                assert by_name["github"]["provenance"] == "bundled"
+                assert by_name["github"]["enabled"] is True
+                assert by_name["github"]["usage"] == 4
+                assert by_name["github"]["locked"] is False
+                assert by_name["ascii-art"]["provenance"] == "agent"
+                assert by_name["ascii-art"]["enabled"] is True
+                assert by_name["ascii-art"]["usage"] == 0
+                assert by_name["ascii-art"]["locked"] is False
 
     @pytest.mark.asyncio
     async def test_skills_call_matches_the_real_signature(self, adapter):
@@ -986,11 +1025,99 @@ class TestSkillsEndpoint:
         """
         with patch("tools.skills_tool.find_all_skills", autospec=True) as mocked:
             mocked.return_value = [{"name": "github", "description": "GitHub skill", "category": "github"}]
+            with patch(
+                "tools.skills_tool.sort_skills",
+                side_effect=lambda x: x,
+            ), patch(
+                "tools.skills_tool._skill_catalog",
+                return_value=[],
+            ), patch(
+                "tools.skill_usage._read_bundled_names",
+                return_value=set(),
+            ), patch(
+                "tools.skill_usage._read_hub_installed_names",
+                return_value=set(),
+            ), patch(
+                "tools.skill_usage._external_skill_names",
+                return_value=set(),
+            ), patch(
+                "tools.skill_usage.load_usage",
+                return_value={},
+            ), patch(
+                "tools.skill_usage.locked_skill_names",
+                return_value=[],
+            ), patch(
+                "tools.skill_usage.activity_count",
+                return_value=0,
+            ), patch(
+                "hermes_cli.config.load_config",
+                return_value={},
+            ), patch(
+                "hermes_cli.skills_config.get_disabled_skills",
+                return_value=set(),
+            ):
+                app = _create_app(adapter)
+                async with TestClient(TestServer(app)) as cli:
+                    resp = await cli.get("/v1/skills")
+                    assert resp.status == 200
+                    mocked.assert_called_once_with(skip_disabled=True)
+
+    @pytest.mark.asyncio
+    async def test_skills_provenance_classification(self, adapter):
+        """Verify hub > bundled > external > agent priority and set-based classification."""
+        fake_skills = [
+            {"name": "github", "description": "GitHub skill", "category": "github"},
+            {"name": "opencode", "description": "OpenCode skill", "category": "dev"},
+            {"name": "ext-skill", "description": "External skill", "category": "ext"},
+            {"name": "my-skill", "description": "Agent skill", "category": "custom"},
+            {"name": "overlap", "description": "In both hub and bundled", "category": "misc"},
+        ]
+        with patch(
+            "tools.skills_tool.find_all_skills",
+            return_value=list(fake_skills),
+        ), patch(
+            "tools.skills_tool.sort_skills",
+            side_effect=lambda x: x,
+        ), patch(
+            "tools.skills_tool._skill_catalog",
+            return_value=[],
+        ), patch(
+            "tools.skill_usage._read_bundled_names",
+            return_value={"github", "overlap"},
+        ), patch(
+            "tools.skill_usage._read_hub_installed_names",
+            return_value={"opencode", "overlap"},
+        ), patch(
+            "tools.skill_usage._external_skill_names",
+            return_value={"ext-skill"},
+        ), patch(
+            "tools.skill_usage.load_usage",
+            return_value={},
+        ), patch(
+            "tools.skill_usage.locked_skill_names",
+            return_value=[],
+        ), patch(
+            "tools.skill_usage.activity_count",
+            return_value=0,
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={},
+        ), patch(
+            "hermes_cli.skills_config.get_disabled_skills",
+            return_value=set(),
+        ):
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/v1/skills")
                 assert resp.status == 200
-                mocked.assert_called_once_with(skip_disabled=False)
+                data = await resp.json()
+                by_name = {s["name"]: s for s in data["data"]}
+                assert by_name["github"]["provenance"] == "bundled"
+                assert by_name["opencode"]["provenance"] == "hub"
+                assert by_name["ext-skill"]["provenance"] == "external"
+                assert by_name["my-skill"]["provenance"] == "agent"
+                # hub takes priority over bundled
+                assert by_name["overlap"]["provenance"] == "hub"
 
 
 class TestToolsetsEndpoint:

@@ -2383,14 +2383,43 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_skills(self, request: web.Request) -> web.Response:
-        """GET /v1/skills — deterministic JSON listing of installed skills (name, description,
-        category), the same set ``/skills list`` shows."""
+        """GET /v1/skills — deterministic JSON listing of installed skills, row-for-row the same
+        fields the dashboard's ``GET /api/skills`` emits: name, description, category, locked,
+        enabled, usage, provenance. ``provenance`` classifies origin ``hub`` > ``bundled`` >
+        ``external`` > ``agent`` (agent = agent-authored or local hand-made — learned on this
+        profile, not shipped or hub-installed). Disabled skills are listed with
+        ``enabled: false`` (dashboard parity)."""
+        def _run() -> list[dict[str, Any]]:
+            from tools.skills_tool import _skill_catalog, find_all_skills, sort_skills
+            from tools.skill_usage import (
+                _external_skill_names, _read_bundled_names, _read_hub_installed_names,
+                activity_count, load_usage, locked_skill_names)
+            from hermes_cli.config import load_config
+            from hermes_cli.skills_config import get_disabled_skills
+            skills = sort_skills(find_all_skills(skip_disabled=True))
+            disabled = get_disabled_skills(load_config())
+            usage = load_usage()
+            # Set-based provenance (same classification as skill_usage.provenance, without a
+            # per-skill manifest read): hub > bundled > external > agent.
+            bundled_names = _read_bundled_names()
+            hub_names = _read_hub_installed_names()
+            external_names = _external_skill_names() - bundled_names - hub_names
+            locked = set(locked_skill_names())
+            dir_by_name = ({e["load_name"]: e["path"].parent.name
+                            for e in _skill_catalog(skip_disabled=True) if e.get("load_name")}
+                           if locked else {})
+            for s in skills:
+                s["locked"] = dir_by_name.get(s["name"], s["name"]) in locked
+                s["enabled"] = s["name"] not in disabled
+                s["usage"] = activity_count(usage.get(s["name"], {}))
+                s["provenance"] = (
+                    "hub" if s["name"] in hub_names
+                    else "bundled" if s["name"] in bundled_names
+                    else "external" if s["name"] in external_names
+                    else "agent")
+            return skills
         try:
-            from tools.skills_tool import find_all_skills, sort_skills
-            # `find_all_skills` accepts only `skip_disabled` (tools/skills_tool.py). Passing an
-            # extra keyword raised TypeError here, the bare `except` swallowed it, and every
-            # client's GET /v1/skills answered 500 instead of the catalogue.
-            skills = sort_skills(find_all_skills(skip_disabled=False))
+            skills = await asyncio.to_thread(_run)
         except Exception:
             logger.exception("GET /v1/skills failed")
             return _error_response("Failed to enumerate skills", 500, err_type="server_error")
